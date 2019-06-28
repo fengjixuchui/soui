@@ -4,6 +4,8 @@
 #include "helper/SplitString.h"
 #include "layout/SouiLayout.h"
 #include "interface/sacchelper-i.h"
+#include "helper/SwndFinder.h"
+
 namespace SOUI
 {
 
@@ -583,12 +585,9 @@ namespace SOUI
 		return m_style;
 	}
 
-	//改用广度优先算法搜索控件,便于逐级查找 2014年12月8日
-	SWindow* SWindow::FindChildByID(int id, int nDeep/* =-1*/)
+
+	SWindow* SWindow::_FindChildByID(int id, int nDeep)
 	{
-		if(id == 0 || nDeep ==0) return NULL;
-
-
 		SWindow *pChild = GetWindow(GSW_FIRSTCHILD);
 		while(pChild)
 		{
@@ -603,7 +602,7 @@ namespace SOUI
 		pChild = GetWindow(GSW_FIRSTCHILD);
 		while(pChild)
 		{
-			SWindow *pChildFind=pChild->FindChildByID(id,nDeep);
+			SWindow *pChildFind=pChild->_FindChildByID(id,nDeep);
 			if(pChildFind) return pChildFind;
 			pChild = pChild->GetWindow(GSW_NEXTSIBLING);
 		}
@@ -611,14 +610,12 @@ namespace SOUI
 		return NULL;
 	}
 
-	SWindow* SWindow::FindChildByName( LPCWSTR pszName , int nDeep)
+	SWindow* SWindow::_FindChildByName(const SStringW & strName, int nDeep)
 	{
-		if(!pszName || nDeep ==0) return NULL;
-
 		SWindow *pChild = GetWindow(GSW_FIRSTCHILD);
 		while(pChild)
 		{
-			if (pChild->m_strName == pszName)
+			if (pChild->m_strName == strName)
 				return pChild;
 			pChild = pChild->GetWindow(GSW_NEXTSIBLING);
 		}
@@ -629,7 +626,7 @@ namespace SOUI
 		pChild = GetWindow(GSW_FIRSTCHILD);
 		while(pChild)
 		{
-			SWindow *pChildFind=pChild->FindChildByName(pszName,nDeep);
+			SWindow *pChildFind=pChild->_FindChildByName(strName,nDeep);
 			if(pChildFind) return pChildFind;
 			pChild = pChild->GetWindow(GSW_NEXTSIBLING);
 		}
@@ -637,8 +634,33 @@ namespace SOUI
 		return NULL;
 	}
 
+	//改用广度优先算法搜索控件,便于逐级查找 2014年12月8日
+	SWindow* SWindow::FindChildByID(int id, int nDeep/* =-1*/)
+	{
+		if(id == SWindowMgr::SWND_INVALID || nDeep ==0) return NULL;
+		SWindow *pRet = SWindowFinder::getSingletonPtr()->FindChildByID(this,id,nDeep);
+		if(pRet) return pRet;
+
+		pRet = _FindChildByID(id,nDeep);
+		if(pRet) SWindowFinder::getSingletonPtr()->CacheResultForID(this,id,nDeep,pRet);
+		return pRet;
+	}
+
+	SWindow* SWindow::FindChildByName( LPCWSTR pszName , int nDeep)
+	{
+		if(pszName==NULL || nDeep ==0) return NULL;
+		SStringW strName(pszName);
+		if(strName.IsEmpty()) return NULL;
+
+		SWindow *pRet = SWindowFinder::getSingletonPtr()->FindChildByName(this,strName,nDeep);
+		if(pRet) return pRet;
+
+		pRet = _FindChildByName(strName,nDeep);
+		if(pRet) SWindowFinder::getSingletonPtr()->CacheResultForName(this,strName,nDeep,pRet);
+		return pRet;
+	}
+
 	const static wchar_t KLabelInclude[] = L"include";	//文件包含的标签
-	const static wchar_t KLabelTemplate[] = L"template";//模板标签
 	const static wchar_t KTempNamespace[] = L"t:";//模板识别ＮＳ
 	const static wchar_t KTempData[] = L"data";//模板参数
 	const static wchar_t KTempParamFmt[] = L"{{%s}}";//模板数据替换格式
@@ -665,7 +687,38 @@ namespace SOUI
 				}
 				if(xmlDoc)
 				{
-					CreateChildren(xmlDoc.child(KLabelInclude));
+					pugi::xml_node xmlInclude = xmlDoc.first_child();
+					if(wcsicmp(xmlInclude.name(),KLabelInclude)==0)
+					{//compatible with 2.9.0.1
+						CreateChildren(xmlInclude);
+					}else
+					{
+						//merger include attribute to xml node.
+						for(pugi::xml_attribute_iterator it = xmlChild.attributes_begin();it != xmlChild.attributes_end();it++)
+						{
+							if(wcsicmp(it->name(),L"src") == 0) 
+								continue;
+							if(xmlInclude.attribute(it->name()))
+							{
+								xmlInclude.attribute(it->name()).set_value(it->value());
+							}else
+							{
+								xmlInclude.append_attribute(it->name()).set_value(it->value());
+							}
+						}
+						//create child.
+						SWindow *pChild = SApplication::getSingleton().CreateWindowByName(xmlInclude.name());
+						if (pChild)
+						{
+							InsertChild(pChild);
+							pChild->InitFromXml(xmlInclude);
+						}
+
+						if(xmlInclude.next_sibling())
+						{
+							SLOGFMTD(_T("warning! multi root include layout is not supported!"));
+						}
+					}
 				}else
 				{
 					SASSERT(FALSE);
@@ -1219,13 +1272,24 @@ namespace SOUI
 			SSendMessage(WM_NCCALCSIZE);//计算非客户区大小
 		}
 
-
-		UpdateChildrenPosition();   //更新子窗口位置
+		//only if window is visible now, we do relayout.
+		if (IsVisible(FALSE))
+		{
+			//don't call UpdateLayout, otherwise will result in dead cycle.
+			if (m_layoutDirty != dirty_clean && GetChildrenCount())
+			{
+				UpdateChildrenPosition();//更新子窗口位置
+			}
+			m_layoutDirty = dirty_clean;
+		}
+		else
+		{//mark layout to self dirty.
+			m_layoutDirty = dirty_self;
+		}
 
 		CRect rcClient;
 		GetClientRect(&rcClient);
 		SSendMessage(WM_SIZE,0,MAKELPARAM(rcClient.Width(),rcClient.Height()));
-		m_layoutDirty = dirty_clean;
 		return TRUE;
 	}
 
@@ -1548,7 +1612,10 @@ namespace SOUI
 		{
 			bShow=m_pParent->IsVisible(TRUE);
 		}
-
+		if (bShow)
+		{//delay reflesh layout of children.
+			UpdateLayout();
+		}
 		if (bShow)
 		{
 			ModifyState(0, WndState_Invisible);
@@ -1726,12 +1793,12 @@ namespace SOUI
 
 	void SWindow::RequestRelayout()
 	{
-		RequestRelayout(this,TRUE);//此处bSourceResizable可以为任意值
+		RequestRelayout(m_swnd,TRUE);//此处bSourceResizable可以为任意值
 	}
 
-	void SWindow::RequestRelayout(SWindow *pSource,BOOL bSourceResizable)
+	void SWindow::RequestRelayout(SWND hSource,BOOL bSourceResizable)
 	{
-		SASSERT(pSource);
+		SASSERT(SWindowMgr::IsWindow(hSource));
 
 		if(bSourceResizable)
 		{//源窗口大小发生变化,当前窗口的所有子窗口全部重新布局
@@ -1740,17 +1807,20 @@ namespace SOUI
 
 		if(m_layoutDirty != dirty_self)
 		{//需要检测当前窗口是不是内容自适应
-			m_layoutDirty = (pSource == this || GetLayoutParam()->IsWrapContent(Any)) ? dirty_self:dirty_child;
+			m_layoutDirty = (hSource == m_swnd || GetLayoutParam()->IsWrapContent(Any)) ? dirty_self:dirty_child;
 		}
 
 		SWindow *pParent = GetParent();
-		if(pParent) pParent->RequestRelayout(pSource,GetLayoutParam()->IsWrapContent(Any) || !IsDisplay());
+		if (pParent && pParent->IsVisible())
+		{
+			pParent->RequestRelayout(hSource, GetLayoutParam()->IsWrapContent(Any) || !IsDisplay());
+		}
 	}
 
 	void SWindow::UpdateLayout()
 	{
 		if(m_layoutDirty == dirty_clean) return;
-		UpdateChildrenPosition();
+		if(GetChildrenCount()) UpdateChildrenPosition();
 		m_layoutDirty = dirty_clean;
 	}
 
@@ -1800,7 +1870,7 @@ namespace SOUI
 		if(hr == S_FALSE)
 			Invalidate();
 		else if(hr == S_OK)
-			RequestRelayout(this,TRUE);
+			RequestRelayout(m_swnd,TRUE);
 		return 0;
 	}
 
@@ -2910,5 +2980,6 @@ namespace SOUI
 		m_pLayoutParam = pLayoutParam;
 		return true;
 	}
+
 
 }//namespace SOUI
